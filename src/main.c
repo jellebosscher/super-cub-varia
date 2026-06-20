@@ -33,35 +33,28 @@ static struct bt_uuid_128 varia_chr_uuid = BT_UUID_INIT_128(
     0xe3, 0x11, 0x7b, 0x66, 0x03, 0x32, 0x4e, 0x6a);
 
 /* ── State ───────────────────────────────────────────────────────────────── */
-static struct bt_conn *varia_conn;
-static uint16_t        varia_chr_handle;
-static int             threat_count = 0;
 static int             closest_dist = 255;
+
+/* A bucket stays "on" for this long after the last notification that set it.
+ * Longer than the ~100 ms inter-notification gap so two rapid-fire
+ * notifications from the same radar cycle both contribute. */
+#define BUCKET_HOLD_MS 400
+static int64_t close_last_seen  = INT64_MIN / 2;
+static int64_t medium_last_seen = INT64_MIN / 2;
+static int64_t long_last_seen   = INT64_MIN / 2;
 
 /* ── LED update ──────────────────────────────────────────────────────────── */
 static void update_led(void)
 {
-    if (threat_count == 0) {
-        gpio_pin_set_dt(&led_close, 0);
-        gpio_pin_set_dt(&led_medium, 0);
-        gpio_pin_set_dt(&led_long, 0);
-        gpio_pin_set_dt(&buzzer, 0);
-    } else if (closest_dist < 40) {
-        gpio_pin_set_dt(&led_close, 1);
-        gpio_pin_set_dt(&led_medium, 0);
-        gpio_pin_set_dt(&led_long, 0);
-        gpio_pin_set_dt(&buzzer, 1);
-    } else if (closest_dist < 100) {
-        gpio_pin_set_dt(&led_close, 0);
-        gpio_pin_set_dt(&led_medium, 1);
-        gpio_pin_set_dt(&led_long, 0);
-        gpio_pin_set_dt(&buzzer, 0);
-    } else {
-        gpio_pin_set_dt(&led_close, 0);
-        gpio_pin_set_dt(&led_medium, 0);
-        gpio_pin_set_dt(&led_long, 1);
-        gpio_pin_set_dt(&buzzer, 0);
-    }
+    int64_t now = k_uptime_get();
+    bool close_on  = (now - close_last_seen)  < BUCKET_HOLD_MS;
+    bool medium_on = (now - medium_last_seen) < BUCKET_HOLD_MS;
+    bool long_on   = (now - long_last_seen)   < BUCKET_HOLD_MS;
+
+    gpio_pin_set_dt(&led_close,  close_on  ? 1 : 0);
+    gpio_pin_set_dt(&led_medium, medium_on ? 1 : 0);
+    gpio_pin_set_dt(&led_long,   long_on   ? 1 : 0);
+    gpio_pin_set_dt(&buzzer,     close_on  ? 1 : 0);
 }
 
 /* ── Radar notification ──────────────────────────────────────────────────── */
@@ -76,16 +69,23 @@ static uint8_t notify_cb(struct bt_conn *conn,
 
     const uint8_t *d = data;
     int threats = (length - 1) / 3;
-    threat_count = threats;
     closest_dist = 255;
 
     if (threats > 0) {
+        int64_t now = k_uptime_get();
         for (int i = 0; i < threats; i++) {
             uint8_t dist = d[2 + i * 3];
+            if (dist <= 40)       close_last_seen  = now;
+            else if (dist <= 100) medium_last_seen = now;
+            else                  long_last_seen   = now;
             if (dist < closest_dist) closest_dist = dist;
         }
         LOG_INF("Threats: %d  closest: %dm", threats, closest_dist);
     } else {
+        /* Genuine all-clear: expire all buckets immediately */
+        close_last_seen  = INT64_MIN / 2;
+        medium_last_seen = INT64_MIN / 2;
+        long_last_seen   = INT64_MIN / 2;
         LOG_INF("All clear");
     }
 
@@ -107,15 +107,15 @@ static uint8_t discover_chr_cb(struct bt_conn *conn,
     }
 
     struct bt_gatt_chrc *chrc = attr->user_data;
-    varia_chr_handle = chrc->value_handle;
+    uint16_t value_handle = chrc->value_handle;
 
     LOG_INF("Characteristic handle: %d props: 0x%02x",
-            varia_chr_handle, chrc->properties);
+            value_handle, chrc->properties);
 
     subscribe_params.notify       = notify_cb;
     subscribe_params.value        = BT_GATT_CCC_NOTIFY;
-    subscribe_params.value_handle = varia_chr_handle;
-    subscribe_params.ccc_handle   = varia_chr_handle + 1;
+    subscribe_params.value_handle = value_handle;
+    subscribe_params.ccc_handle   = value_handle + 1;
 
     struct bt_conn_info info;
     bt_conn_get_info(conn, &info);
@@ -202,8 +202,8 @@ static struct bt_conn_auth_info_cb auth_info_cb = {
 static void security_changed_cb(struct bt_conn *conn, bt_security_t level,
                                   enum bt_security_err err)
 {
+    /* Discovery is already started from connected_cb; log only */
     LOG_INF("Security changed: level=%d err=%d", level, err);
-    start_discovery(conn);
 }
 
 static void connected_cb(struct bt_conn *conn, uint8_t err)
@@ -214,24 +214,20 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
     }
 
     LOG_INF("Connected");
-    varia_conn = bt_conn_ref(conn);
     start_discovery(conn);
 }
 
 static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 {
     LOG_INF("Disconnected, reason: 0x%02x", reason);
-    threat_count = 0;
     closest_dist = 255;
+    close_last_seen  = INT64_MIN / 2;
+    medium_last_seen = INT64_MIN / 2;
+    long_last_seen   = INT64_MIN / 2;
     gpio_pin_set_dt(&led_close, 0);
     gpio_pin_set_dt(&led_medium, 0);
     gpio_pin_set_dt(&led_long, 0);
     gpio_pin_set_dt(&buzzer, 0);
-
-    if (varia_conn) {
-        bt_conn_unref(varia_conn);
-        varia_conn = NULL;
-    }
 
     /* Add a 2 s delay before rescanning to avoid a rapid reconnect storm */
     k_sleep(K_MSEC(2000));
@@ -284,7 +280,7 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi,
             name, rssi, name_match, svc_match);
     bt_le_scan_stop();
 
-    struct bt_conn *conn;
+    struct bt_conn *conn = NULL;
     struct bt_conn_le_create_param create_param = BT_CONN_LE_CREATE_PARAM_INIT(
         BT_CONN_LE_OPT_NONE,
         BT_GAP_SCAN_FAST_INTERVAL,
@@ -314,15 +310,14 @@ int main(void)
     gpio_pin_configure_dt(&led_long, GPIO_OUTPUT_INACTIVE);
     gpio_pin_configure_dt(&buzzer, GPIO_OUTPUT_INACTIVE);
 
-    gpio_pin_set_dt(&led_long, 1); k_sleep(K_MSEC(100));
-    gpio_pin_set_dt(&led_long, 0); k_sleep(K_MSEC(100));
-
-    gpio_pin_set_dt(&led_medium, 1); k_sleep(K_MSEC(100));
-    gpio_pin_set_dt(&led_medium, 0); k_sleep(K_MSEC(100));
-
-
-    gpio_pin_set_dt(&led_close, 1); k_sleep(K_MSEC(100));
-    gpio_pin_set_dt(&led_close, 0); k_sleep(K_MSEC(100));
+    for (int i = 0; i < 5; i++) {
+        gpio_pin_set_dt(&led_long, 1); k_sleep(K_MSEC(200));
+        gpio_pin_set_dt(&led_long, 0); k_sleep(K_MSEC(100));
+        gpio_pin_set_dt(&led_medium, 1); k_sleep(K_MSEC(200));
+        gpio_pin_set_dt(&led_medium, 0); k_sleep(K_MSEC(100));
+        gpio_pin_set_dt(&led_close, 1); k_sleep(K_MSEC(200));
+        gpio_pin_set_dt(&led_close, 0); k_sleep(K_MSEC(100));
+    }
 
     bt_enable(NULL);
     settings_load();
